@@ -66,10 +66,25 @@ pub async fn handle_event_upload(
                         }
                     }
                     if let Some(task_id) = &event_data.task_id {
-                        // 确保设备连接
-                        if let Err(e) = vessel_manager.ensure_connection(task_id).await {
-                            log::warn!("无法建立设备连接 {}: {}", task_id, e);
-                            // 继续处理，但记录警告
+                        // 先检查设备状态，避免尝试连接离线设备
+                        match vessel_manager.check_device_status(task_id).await {
+                            Ok(is_online) => {
+                                if is_online {
+                                    // 设备在线，确保连接
+                                    if let Err(e) = vessel_manager.ensure_connection(task_id).await {
+                                        log::warn!("无法建立设备连接 {}: {}", task_id, e);
+                                    }
+                                } else {
+                                    log::info!("设备 {} 当前离线，跳过连接尝试", task_id);
+                                }
+                            }
+                            Err(e) => {
+                                log::warn!("检查设备状态失败 {}: {}", task_id, e);
+                                // 即使检查失败也尝试连接
+                                if let Err(e) = vessel_manager.ensure_connection(task_id).await {
+                                    log::warn!("无法建立设备连接 {}: {}", task_id, e);
+                                }
+                            }
                         }
                     }
 

@@ -6,6 +6,7 @@ use serde_json::Value;
 use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::{Mutex, RwLock};
+use lru::LruCache;
 
 use crate::{database::Device, error::AppError, websocket::EventWebSocketManager};
 
@@ -20,9 +21,10 @@ pub struct PositionData {
 pub struct VesselWebSocketManager {
     db_manager: crate::database::DatabaseManager,
     connections: Arc<RwLock<HashMap<String, VesselConnection>>>,
-    position_cache: Arc<RwLock<HashMap<String, PositionData>>>,
+    position_cache: Arc<RwLock<LruCache<String, PositionData>>>, // 使用LRU缓存
     running: Arc<RwLock<bool>>,
     ws_manager: Option<web::Data<Mutex<EventWebSocketManager>>>, // 用于WebSocket广播
+    cache_size: usize, // 缓存大小限制
 }
 
 #[derive(Debug)]
@@ -33,12 +35,19 @@ struct VesselConnection {
 
 impl VesselWebSocketManager {
     pub fn new(db_manager: crate::database::DatabaseManager) -> Self {
+        Self::new_with_cache_size(db_manager, 1000) // 默认缓存1000个位置数据
+    }
+
+    pub fn new_with_cache_size(db_manager: crate::database::DatabaseManager, cache_size: usize) -> Self {
         Self {
             db_manager,
             connections: Arc::new(RwLock::new(HashMap::new())),
-            position_cache: Arc::new(RwLock::new(HashMap::new())),
+            position_cache: Arc::new(RwLock::new(LruCache::new(
+                std::num::NonZeroUsize::new(cache_size).unwrap_or_else(|| std::num::NonZeroUsize::new(1000).unwrap())
+            ))),
             running: Arc::new(RwLock::new(false)),
             ws_manager: None,
+            cache_size,
         }
     }
 
@@ -115,8 +124,9 @@ impl VesselWebSocketManager {
         let device_id = device.device_id.clone();
         let host = device.vessel_tcp_host.clone();
         let port = device.vessel_tcp_port;
-        let max_retries = 3;
+        let max_retries = 5; // 增加重试次数
         let mut retry_count = 0;
+        let mut consecutive_failures = 0; // 连续失败计数
 
         let connections = self.connections.clone();
         let position_cache = self.position_cache.clone();
@@ -138,13 +148,20 @@ impl VesselWebSocketManager {
                 // 检查重试次数
                 if retry_count >= max_retries {
                     error!("设备 {} 连接失败，已达到最大重试次数", device_id);
-                    break;
+                    // 实施指数退避策略
+                    let backoff_seconds = std::cmp::min(300, 30 * (1 << consecutive_failures)); // 最大5分钟
+                    info!("设备 {} 将在 {} 秒后重试", device_id, backoff_seconds);
+                    tokio::time::sleep(tokio::time::Duration::from_secs(backoff_seconds)).await;
+                    consecutive_failures += 1;
+                    retry_count = 0; // 重置短时重试计数
+                    continue;
                 }
 
                 match tokio_tungstenite::connect_async(&uri).await {
                     Ok((ws_stream, _)) => {
                         info!("成功连接到船只WebSocket: {} (设备: {})", uri, device_id);
                         retry_count = 0; // 重置重试计数器
+                        consecutive_failures = 0; // 重置连续失败计数
 
                         let (_, mut read) = ws_stream.split();
 
@@ -171,8 +188,19 @@ impl VesselWebSocketManager {
 
                             match message {
                                 Ok(tokio_tungstenite::tungstenite::Message::Text(text)) => {
-                                    // 处理船只数据
+                                    // 检查是否是设备关闭消息
                                     if let Ok(data) = serde_json::from_str::<Value>(&text) {
+                                        // 检查设备是否返回关闭状态
+                                        if let (Some(code), Some(msg)) = (
+                                            data.get("code").and_then(|v| v.as_i64()),
+                                            data.get("msg").and_then(|v| v.as_str())
+                                        ) {
+                                            if code == 0 && msg.contains("断开") {
+                                                warn!("设备 {} 返回关闭状态: {}", device_id, msg);
+                                                break;
+                                            }
+                                        }
+
                                         // 只有MsgID等于0的数据才保存
                                         if data.get("MsgID").and_then(|v| v.as_i64()) == Some(0) {
                                             let position_data = PositionData {
@@ -183,7 +211,7 @@ impl VesselWebSocketManager {
                                             // 更新位置缓存
                                             {
                                                 let mut cache = position_cache.write().await;
-                                                cache.insert(
+                                                cache.put(
                                                     device_id.clone(),
                                                     position_data.clone(),
                                                 );
@@ -194,7 +222,24 @@ impl VesselWebSocketManager {
                                     }
                                 }
                                 Ok(tokio_tungstenite::tungstenite::Message::Close(_)) => {
-                                    info!("船只WebSocket连接关闭: {} (设备: {})", uri, device_id);
+                                    info!("船只WebSocket连接正常关闭: {} (设备: {})", uri, device_id);
+                                    break;
+                                }
+                                Err(tokio_tungstenite::tungstenite::Error::ConnectionClosed) => {
+                                    info!("船只WebSocket连接已关闭: {} (设备: {})", uri, device_id);
+                                    break;
+                                }
+                                Err(tokio_tungstenite::tungstenite::Error::AlreadyClosed) => {
+                                    warn!("船只WebSocket连接已经关闭: {} (设备: {})", uri, device_id);
+                                    break;
+                                }
+                                Err(tokio_tungstenite::tungstenite::Error::Io(ref e)) 
+                                    if e.kind() == std::io::ErrorKind::ConnectionReset => 
+                                {
+                                    // 特殊处理连接重置错误
+                                    warn!("船只WebSocket连接被重置: {} (设备: {})", uri, device_id);
+                                    // 立即重试，但不计入连续失败
+                                    retry_count += 1;
                                     break;
                                 }
                                 Err(e) => {
@@ -202,6 +247,8 @@ impl VesselWebSocketManager {
                                         "船只WebSocket接收错误: {} (设备: {}): {}",
                                         uri, device_id, e
                                     );
+                                    // 对于其他错误，计入重试次数
+                                    retry_count += 1;
                                     break;
                                 }
                                 _ => {}
@@ -223,14 +270,23 @@ impl VesselWebSocketManager {
                     }
                 }
 
-                // 等待5秒后重试
-                tokio::time::sleep(tokio::time::Duration::from_secs(5)).await;
+                // 根据连续失败次数调整等待时间
+                let wait_seconds = if consecutive_failures > 0 {
+                    std::cmp::min(60, 5 * consecutive_failures) // 最大1分钟
+                } else {
+                    5 // 默认5秒
+                };
+
+                info!("设备 {} 将在 {} 秒后重试连接 (重试次数: {}/{})", 
+                      device_id, wait_seconds, retry_count, max_retries);
+                tokio::time::sleep(tokio::time::Duration::from_secs(wait_seconds)).await;
             }
         });
     }
 
     pub async fn get_position_data(&self, device_id: &str) -> Option<PositionData> {
-        let cache = self.position_cache.read().await;
+        let mut cache = self.position_cache.write().await;
+        // LruCache的get方法会更新访问顺序，所以需要可变引用
         cache.get(device_id).cloned()
     }
 
@@ -285,6 +341,33 @@ impl VesselWebSocketManager {
         }
 
         Ok(true)
+    }
+
+    // 检查设备是否在线
+    pub async fn check_device_status(&self, device_id: &str) -> Result<bool, AppError> {
+        // 检查连接管理器中是否有该设备的连接
+        {
+            let conns = self.connections.read().await;
+            if conns.contains_key(device_id) {
+                return Ok(true);
+            }
+        }
+
+        // 检查缓存中是否有最近的位置数据（表示最近连接过）
+        {
+            let mut cache = self.position_cache.write().await;
+            // LruCache的get方法会更新访问顺序，所以需要可变引用
+            if let Some(pos_data) = cache.get(device_id) {
+                // 如果位置数据是5分钟内的，认为设备可能在线
+                let now = chrono::Utc::now();
+                let diff = now.signed_duration_since(pos_data.timestamp);
+                if diff.num_minutes() < 5 {
+                    return Ok(true);
+                }
+            }
+        }
+
+        Ok(false)
     }
 }
 
