@@ -1,8 +1,8 @@
 use actix_web::http::header::{ContentDisposition, DispositionType};
 use serde::Deserialize;
-use std::collections::{HashMap, HashSet};
 use std::io::Write;
 use std::path::Path;
+use std::sync::Arc;
 use tokio::fs;
 use tokio::io::AsyncReadExt;
 // src/handlers.rs
@@ -47,6 +47,7 @@ pub async fn handle_event_upload(
     // 处理文件上传
     let saved_files =
         crate::file_handlers::save_uploaded_file(multipart, "./event_uploads").await?;
+
     // 解析事件数据
     for file in &saved_files {
         if file.file_name.ends_with(".json") {
@@ -65,13 +66,62 @@ pub async fn handle_event_upload(
                             log::error!("广播原始JSON数据失败: {}", e);
                         }
                     }
+
+                    // 检查是否包含"人"类型的识别结果
+                    let mut has_person = false;
+                    if let Some(details) = &event_data.details {
+                        for detail in details {
+                            if let Some(targets) = &detail.targets {
+                                for target in targets {
+                                    if let Some(label) = &target.label {
+                                        if label.contains("人")
+                                            || label.to_lowercase().contains("person")
+                                        {
+                                            has_person = true;
+                                            log::info!("检测到人物目标: {}", label);
+                                            break;
+                                        }
+                                    }
+                                }
+                                if has_person {
+                                    break;
+                                }
+                            }
+                        }
+                    }
+
+                    // 如果检测到人，发送特定消息
+                    if has_person {
+                        if let Some(task_id) = &event_data.task_id {
+                            let control_message = serde_json::json!({
+                                "MsgID": 86,
+                                "Params": "OPEN"
+                            });
+
+                            if let Ok(message_json) = serde_json::to_string(&control_message) {
+                                log::info!("发送控制消息到设备 {}: {}", task_id, message_json);
+                                if let Err(e) = vessel_manager
+                                    .send_control_message(task_id, &message_json)
+                                    .await
+                                {
+                                    log::error!("发送控制消息失败: {}", e);
+                                }
+                            }
+
+                            Arc::clone(&vessel_manager)
+                                .start_clone_timer(task_id.clone())
+                                .await;
+                        }
+                    }
+
                     if let Some(task_id) = &event_data.task_id {
                         // 先检查设备状态，避免尝试连接离线设备
                         match vessel_manager.check_device_status(task_id).await {
                             Ok(is_online) => {
                                 if is_online {
                                     // 设备在线，确保连接
-                                    if let Err(e) = vessel_manager.ensure_connection(task_id).await {
+                                    if let Err(e) = vessel_manager.ensure_connection(task_id).await
+                                    {
                                         log::warn!("无法建立设备连接 {}: {}", task_id, e);
                                     }
                                 } else {
@@ -491,7 +541,7 @@ async fn create_event_zip_to_file(
     let options = SimpleFileOptions::default().compression_method(zip::CompressionMethod::Deflated);
 
     let mut entries = fs::read_dir(event_dir).await?;
-    let mut file_count = 0;
+    let file_count = 0;
 
     while let Some(entry) = entries.next_entry().await? {
         let path = entry.path();

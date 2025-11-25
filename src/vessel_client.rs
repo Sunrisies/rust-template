@@ -1,14 +1,19 @@
 use actix_web::web;
-use futures_util::StreamExt;
+use futures_util::{stream::SplitSink, SinkExt, StreamExt};
 // src/vessel_client.rs
 use log::{error, info, warn};
+use lru::LruCache;
 use serde_json::Value;
 use std::collections::HashMap;
 use std::sync::Arc;
-use tokio::sync::{Mutex, RwLock};
-use lru::LruCache;
+use std::time::Duration;
+use tokio::{
+    net::TcpStream,
+    sync::{mpsc, Mutex, RwLock},
+};
+use tokio_tungstenite::{tungstenite::Message, MaybeTlsStream, WebSocketStream};
 
-use crate::{database::Device, error::AppError, websocket::EventWebSocketManager};
+use crate::{error::AppError, websocket::EventWebSocketManager};
 
 // 位置数据结构
 #[derive(Debug, Clone)]
@@ -24,12 +29,15 @@ pub struct VesselWebSocketManager {
     position_cache: Arc<RwLock<LruCache<String, PositionData>>>, // 使用LRU缓存
     running: Arc<RwLock<bool>>,
     ws_manager: Option<web::Data<Mutex<EventWebSocketManager>>>, // 用于WebSocket广播
-    cache_size: usize, // 缓存大小限制
+    cache_size: usize,                                           // 缓存大小限制
+    device_timers: Arc<RwLock<HashMap<String, tokio::task::JoinHandle<()>>>>, // 存储每个设备的定时器句柄
 }
 
 #[derive(Debug)]
 struct VesselConnection {
     device_id: String,
+    sender: mpsc::UnboundedSender<Message>,
+    write: Mutex<SplitSink<WebSocketStream<MaybeTlsStream<TcpStream>>, Message>>,
     // 可以添加更多连接状态信息
 }
 
@@ -38,16 +46,21 @@ impl VesselWebSocketManager {
         Self::new_with_cache_size(db_manager, 1000) // 默认缓存1000个位置数据
     }
 
-    pub fn new_with_cache_size(db_manager: crate::database::DatabaseManager, cache_size: usize) -> Self {
+    pub fn new_with_cache_size(
+        db_manager: crate::database::DatabaseManager,
+        cache_size: usize,
+    ) -> Self {
         Self {
             db_manager,
             connections: Arc::new(RwLock::new(HashMap::new())),
             position_cache: Arc::new(RwLock::new(LruCache::new(
-                std::num::NonZeroUsize::new(cache_size).unwrap_or_else(|| std::num::NonZeroUsize::new(1000).unwrap())
+                std::num::NonZeroUsize::new(cache_size)
+                    .unwrap_or_else(|| std::num::NonZeroUsize::new(1000).unwrap()),
             ))),
             running: Arc::new(RwLock::new(false)),
             ws_manager: None,
             cache_size,
+            device_timers: Arc::new(RwLock::new(HashMap::new())),
         }
     }
 
@@ -131,7 +144,6 @@ impl VesselWebSocketManager {
         let connections = self.connections.clone();
         let position_cache = self.position_cache.clone();
         let running = self.running.clone();
-        let ws_manager = self.ws_manager.clone();
 
         tokio::spawn(async move {
             let uri = format!("ws://{}/{}", host, port);
@@ -163,8 +175,8 @@ impl VesselWebSocketManager {
                         retry_count = 0; // 重置重试计数器
                         consecutive_failures = 0; // 重置连续失败计数
 
-                        let (_, mut read) = ws_stream.split();
-
+                        let (write, mut read) = ws_stream.split();
+                        let (tx, mut rx) = mpsc::unbounded_channel::<Message>();
                         // 添加到连接管理器
                         {
                             let mut conns = connections.write().await;
@@ -172,10 +184,23 @@ impl VesselWebSocketManager {
                                 device_id.clone(),
                                 VesselConnection {
                                     device_id: device_id.clone(),
+                                    sender: tx,
+                                    write: Mutex::new(write),
                                 },
                             );
                         }
 
+                        // write.send(Message::text(control_message.to_string())).await;
+                        // 启动写入任务
+                        // let device_id_write = device_id.clone();
+                        // let write_task = tokio::spawn(async move {
+                        //     while let Some(msg) = rx.recv().await {
+                        //         if let Err(e) = write.send(msg).await {
+                        //             error!("发送消息失败 (设备: {}): {}", device_id_write, e);
+                        //             break;
+                        //         }
+                        //     }
+                        // });
                         // 处理消息
                         while let Some(message) = read.next().await {
                             // 检查是否还在运行
@@ -193,7 +218,7 @@ impl VesselWebSocketManager {
                                         // 检查设备是否返回关闭状态
                                         if let (Some(code), Some(msg)) = (
                                             data.get("code").and_then(|v| v.as_i64()),
-                                            data.get("msg").and_then(|v| v.as_str())
+                                            data.get("msg").and_then(|v| v.as_str()),
                                         ) {
                                             if code == 0 && msg.contains("断开") {
                                                 warn!("设备 {} 返回关闭状态: {}", device_id, msg);
@@ -211,10 +236,7 @@ impl VesselWebSocketManager {
                                             // 更新位置缓存
                                             {
                                                 let mut cache = position_cache.write().await;
-                                                cache.put(
-                                                    device_id.clone(),
-                                                    position_data.clone(),
-                                                );
+                                                cache.put(device_id.clone(), position_data.clone());
                                             }
                                         }
                                     } else {
@@ -222,7 +244,10 @@ impl VesselWebSocketManager {
                                     }
                                 }
                                 Ok(tokio_tungstenite::tungstenite::Message::Close(_)) => {
-                                    info!("船只WebSocket连接正常关闭: {} (设备: {})", uri, device_id);
+                                    info!(
+                                        "船只WebSocket连接正常关闭: {} (设备: {})",
+                                        uri, device_id
+                                    );
                                     break;
                                 }
                                 Err(tokio_tungstenite::tungstenite::Error::ConnectionClosed) => {
@@ -230,11 +255,14 @@ impl VesselWebSocketManager {
                                     break;
                                 }
                                 Err(tokio_tungstenite::tungstenite::Error::AlreadyClosed) => {
-                                    warn!("船只WebSocket连接已经关闭: {} (设备: {})", uri, device_id);
+                                    warn!(
+                                        "船只WebSocket连接已经关闭: {} (设备: {})",
+                                        uri, device_id
+                                    );
                                     break;
                                 }
-                                Err(tokio_tungstenite::tungstenite::Error::Io(ref e)) 
-                                    if e.kind() == std::io::ErrorKind::ConnectionReset => 
+                                Err(tokio_tungstenite::tungstenite::Error::Io(ref e))
+                                    if e.kind() == std::io::ErrorKind::ConnectionReset =>
                                 {
                                     // 特殊处理连接重置错误
                                     warn!("船只WebSocket连接被重置: {} (设备: {})", uri, device_id);
@@ -254,7 +282,8 @@ impl VesselWebSocketManager {
                                 _ => {}
                             }
                         }
-
+                        // 终止写入任务
+                        // write_task.abort();
                         // 连接断开，从管理器移除
                         {
                             let mut conns = connections.write().await;
@@ -277,11 +306,56 @@ impl VesselWebSocketManager {
                     5 // 默认5秒
                 };
 
-                info!("设备 {} 将在 {} 秒后重试连接 (重试次数: {}/{})", 
-                      device_id, wait_seconds, retry_count, max_retries);
+                info!(
+                    "设备 {} 将在 {} 秒后重试连接 (重试次数: {}/{})",
+                    device_id, wait_seconds, retry_count, max_retries
+                );
                 tokio::time::sleep(tokio::time::Duration::from_secs(wait_seconds)).await;
             }
         });
+    }
+
+    pub async fn start_clone_timer(self: Arc<Self>, device_id: String) {
+        let vessel_manager = Arc::clone(&self);
+        let device_id_clone = device_id.clone();
+
+        // 取消之前的定时器（如果有）
+        {
+            let mut timers = self.device_timers.write().await;
+            if let Some(timer) = timers.remove(&device_id) {
+                timer.abort();
+            }
+        }
+
+        // 创建新的定时器
+        let timer = tokio::spawn(async move {
+            // 等待10秒
+            tokio::time::sleep(Duration::from_secs(10)).await;
+
+            // 发送CLONE消息
+            let control_message = serde_json::json!({
+                "MsgID": 86,
+                "Params": "CLONE"
+            });
+
+            if let Ok(message_json) = serde_json::to_string(&control_message) {
+                log::info!("10秒无新数据，发送CLONE关闭消息到设备: {}", device_id_clone);
+                if let Err(e) = vessel_manager
+                    .send_control_message(&device_id_clone, &message_json)
+                    .await
+                {
+                    log::error!("发送CLONE关闭消息失败: {}", e);
+                }
+            }
+
+            // 从定时器映射中移除
+            let mut timers = vessel_manager.device_timers.write().await;
+            timers.remove(&device_id_clone);
+        });
+
+        // 保存定时器句柄
+        let mut timers = self.device_timers.write().await;
+        timers.insert(device_id, timer);
     }
 
     pub async fn get_position_data(&self, device_id: &str) -> Option<PositionData> {
@@ -368,6 +442,37 @@ impl VesselWebSocketManager {
         }
 
         Ok(false)
+    }
+
+    // 发送控制消息到设备
+    pub async fn send_control_message(
+        &self,
+        device_id: &str,
+        message: &str,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let conns = self.connections.read().await;
+        if let Some(conn) = conns.get(device_id) {
+            // 使用 Message::text() 方法创建文本消息
+            log::info!("发送控制消息到设备: {}", message);
+            log::info!("conn.sender{:?}", conn.sender);
+            // 先获取锁，然后发送消息
+            let mut write = conn.write.lock().await;
+            match write.send(Message::text(message.to_string())).await {
+                Ok(_) => {
+                    log::info!("消息发送成功到设备: {}", device_id);
+                }
+                Err(e) => {
+                    log::error!("发送消息到设备 {} 失败: {}", device_id, e);
+                    // 可以选择在这里移除断开的连接
+                }
+            }
+
+            // write.send(Message::text(control_message.to_string())).await;
+            conn.sender.send(Message::text(message.to_string()))?;
+            Ok(())
+        } else {
+            Err(format!("设备 {} 未连接", device_id).into())
+        }
     }
 }
 

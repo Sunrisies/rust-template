@@ -7,7 +7,7 @@ use serde_json;
 use tokio::sync::Mutex;
 
 use super::manager::EventWebSocketManager;
-use super::models::{ClientMessage, EventNotification, SystemMessage};
+use super::models::{ClientMessage, SystemMessage};
 
 // WebSocket路由处理函数
 pub async fn event_websocket_route(
